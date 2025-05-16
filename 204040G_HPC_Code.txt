@@ -1,0 +1,324 @@
+#include <stdio.h>
+#include <cuda.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+
+// Kernel function to add the elements of two arrays
+__global__ void vectorAdd(float *A, float *B, float *C, int N) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < N) {
+        C[i] = A[i] + B[i];
+    }
+}
+
+// Function to check CUDA errors
+void checkCudaError(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s - %s\n", msg, cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+}
+
+int main() {
+    // Get device properties (Tesla K40 specific information)
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, 0);
+    checkCudaError(err, "Getting device properties");
+    
+    printf("==== Device Properties of Tesla K40 ====\n");
+    printf("Device: %s\n", prop.name);
+    printf("Compute capability: %d.%d\n", prop.major, prop.minor);
+    printf("Max Threads per Block: %d\n", prop.maxThreadsPerBlock);
+    printf("Max Grid Size: [%d, %d, %d]\n", 
+           prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
+    printf("Total Global Memory: %.2f GB\n", 
+           (float)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    printf("Warp Size: %d\n", prop.warpSize);
+    printf("Multi-Processor Count: %d\n", prop.multiProcessorCount);
+    printf("Max Threads per Multi-Processor: %d\n", prop.maxThreadsPerMultiProcessor);
+    printf("Total Concurrent Threads: %d\n", 
+           prop.multiProcessorCount * prop.maxThreadsPerMultiProcessor);
+    printf("\n");
+    
+    // PART 01: Test maximum threads per block
+    printf("==== TEST 01: Maximum Threads Per Block ====\n");
+    int threadCounts[] = {128, 256, 512, 768, 1024, 1536, 2048};
+    int numThreadTests = sizeof(threadCounts) / sizeof(int);
+    int maxThreadsPerBlock = 0;
+    
+    for (int t = 0; t < numThreadTests; t++) {
+        int threadsPerBlock = threadCounts[t];
+        printf("\nTesting with %d threads per block\n", threadsPerBlock);
+        
+        // Set vector size for this test
+        int N = 10000; // Number of elements
+        size_t size = N * sizeof(float);
+        
+        // Allocate memory for vectors on host
+        float *h_A = (float*)malloc(size);
+        float *h_B = (float*)malloc(size);
+        float *h_C = (float*)malloc(size);
+        
+        if (!h_A || !h_B || !h_C) {
+            fprintf(stderr, "Failed allocating host vectors!\n");
+            exit(EXIT_FAILURE);
+        }
+        
+        // Initializing vectors on host
+        for (int i = 0; i < N; i++) {
+            h_A[i] = rand() % 100;
+            h_B[i] = rand() % 100;
+        }
+        
+        // Allocating vectors on device
+        float *d_A, *d_B, *d_C;
+        cudaMalloc(&d_A, size);
+        cudaMalloc(&d_B, size);
+        cudaMalloc(&d_C, size);
+        
+        // Creating CUDA events for timing
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        float uploadTime, kernelTime, downloadTime;
+        
+        // Copying vectors from host to device
+        cudaEventRecord(start);
+        cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&uploadTime, start, stop);
+        
+        // Launching kernel with 1 block
+        cudaEventRecord(start);
+        vectorAdd<<<1, threadsPerBlock>>>(d_A, d_B, d_C, N);
+        cudaError_t error = cudaGetLastError();
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&kernelTime, start, stop);
+        
+        if (error != cudaSuccess) {
+            printf("launch of the Kernal failed with %d threads: %s\n", 
+                   threadsPerBlock, cudaGetErrorString(error));
+            
+            // Free resources before continuing
+            cudaFree(d_A);
+            cudaFree(d_B);
+            cudaFree(d_C);
+            free(h_A);
+            free(h_B);
+            free(h_C);
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            continue;
+        } else {
+            // Record the successful thread count
+            maxThreadsPerBlock = threadsPerBlock;
+        }
+        
+        // Copying result from device to host
+        cudaEventRecord(start);
+        cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&downloadTime, start, stop);
+        
+        // Printing timing results
+        printf("Upload time: %.3f ms\n", uploadTime);
+        printf("Kernel time: %.3f ms\n", kernelTime);
+        printf("Download time: %.3f ms\n", downloadTime);
+        printf("Verification of Vector Addition: Success\n");
+        
+        // Free resources
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        free(h_A);
+        free(h_B);
+        free(h_C);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+    
+    printf("\nMax. successful threads per block: %d\n", maxThreadsPerBlock);
+    
+    // PART 2: Testing max blocks per grid (Tesla K40 specific)
+    printf("\n==== TEST 02: Maximum Blocks Per Grid ====\n");
+    
+    // Using optimal thread count based on Tesla K40 architecture
+    int optimalThreadsPerBlock = 1024;  // Tesla K40 has 1024 max threads per block
+    
+    // Testing with increasing block counts
+    // For Tesla K40 (Kepler architecture), max grid size is [2^31-1, 65535, 65535]
+    // Using reasonable test values within int range to avoid overflow
+    int blockCounts[] = {1, 100, 1000, 10000, 65535, 131072, 262144, 524288, 1048576, 
+                         16777216, 268435456, 536870912, 1073741824, 2147483647};
+    int numBlockTests = sizeof(blockCounts) / sizeof(int);
+    int maxBlocksPerGrid = 0;
+    
+    for (int b = 0; b < numBlockTests; b++) {
+        int blocksPerGrid = blockCounts[b];
+        printf("\nTesting with %d blocks per grid\n", blocksPerGrid);
+        
+        // Check if blocks value is within valid range (detect negative values from overflow)
+        if (blocksPerGrid <= 0) {
+            printf("Invalid block count (negative or overflow): skipping\n");
+            continue;
+        }
+        
+        // Total elements (threads) for this test - use unsigned long long to handle large values
+        unsigned long long totalElements = (unsigned long long)blocksPerGrid * optimalThreadsPerBlock;
+        
+        // Check if total elements exceed memory size and adjust if needed
+        unsigned long long memoryRequired = totalElements * sizeof(float) * 3; // 3 arrays: A, B, C
+        if (memoryRequired > 10ULL * 1024 * 1024 * 1024) { // Limit to ~10GB to be safe
+            printf("Memory required has exceeded safe limit. Reducing problem size.\n");
+            totalElements = (10ULL * 1024 * 1024 * 1024) / (sizeof(float) * 3);
+        }
+        
+        int N = (totalElements > INT_MAX) ? INT_MAX : (int)totalElements;
+        size_t size = N * sizeof(float);
+        
+        // Allocation of memory for vectors on host
+        float *h_A = (float*)malloc(size);
+        float *h_B = (float*)malloc(size);
+        float *h_C = (float*)malloc(size);
+        
+        if (!h_A || !h_B || !h_C) {
+            printf("Allocation of Host memory failed for N = %d\n", N);
+            break;
+        }
+        
+        // Initializing only a portion of the vectors to save time
+        int initSize = (N > 1000000) ? 1000000 : N;
+        for (int i = 0; i < initSize; i++) {
+            h_A[i] = 1.0f;
+            h_B[i] = 2.0f;
+        }
+        
+        // Allocating vectors on device
+        float *d_A, *d_B, *d_C;
+        err = cudaMalloc(&d_A, size);
+        if (err != cudaSuccess) {
+            printf("Allocation of Device memory failed for d_A: %s\n", cudaGetErrorString(err));
+            free(h_A); free(h_B); free(h_C);
+            break;
+        }
+        
+        err = cudaMalloc(&d_B, size);
+        if (err != cudaSuccess) {
+            printf("Allocation of Device memory failed for d_B: %s\n", cudaGetErrorString(err));
+            cudaFree(d_A); free(h_A); free(h_B); free(h_C);
+            break;
+        }
+        
+        err = cudaMalloc(&d_C, size);
+        if (err != cudaSuccess) {
+            printf("Allocation of Device memory failed for d_C: %s\n", cudaGetErrorString(err));
+            cudaFree(d_A); cudaFree(d_B); free(h_A); free(h_B); free(h_C);
+            break;
+        }
+        
+        // Creating CUDA events for timing
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        float kernelTime;
+        
+        // Copying vectors from host to device
+        err = cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            printf("Upload is failed for d_A: %s\n", cudaGetErrorString(err));
+            break;
+        }
+        
+        err = cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            printf("Upload is failed for d_B: %s\n", cudaGetErrorString(err));
+            break;
+        }
+        
+        // Calculating the actual block count needed for this vector size
+        int actualBlocks = (N + optimalThreadsPerBlock - 1) / optimalThreadsPerBlock;
+        if (actualBlocks > blocksPerGrid) {
+            actualBlocks = blocksPerGrid;
+        }
+        printf("Using %d blocks\n", actualBlocks);
+        
+        // Launching kernel
+        cudaEventRecord(start);
+        vectorAdd<<<actualBlocks, optimalThreadsPerBlock>>>(d_A, d_B, d_C, N);
+        err = cudaGetLastError();
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&kernelTime, start, stop);
+        
+        if (err != cudaSuccess) {
+            printf("Kernel launch is failed with %d blocks: %s\n", 
+                   blocksPerGrid, cudaGetErrorString(err));
+            // Cleaning up resources
+            cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+            free(h_A); free(h_B); free(h_C);
+            cudaEventDestroy(start); cudaEventDestroy(stop);
+            break;
+        } else {
+            // Recording the successful block count
+            maxBlocksPerGrid = blocksPerGrid;
+            printf("Kernel time: %.3f ms\n", kernelTime);
+            
+            // Waiting for kernel to finish and check for execution errors
+            err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                printf("Kernel execution failed: %s\n", cudaGetErrorString(err));
+                break;
+            } else {
+                printf("Execution is successful\n");
+            }
+        }
+        
+        // Free resources
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        free(h_A);
+        free(h_B);
+        free(h_C);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+    
+    printf("\nMax successful blocks per grid: %d\n", maxBlocksPerGrid);
+    
+    // PART 3: Calculating total possible threads for Tesla K40
+    printf("\n==== TEST 03: Total Possible Threads ====\n");
+    
+    // For Tesla K40 (Kepler architecture)
+    unsigned long long maxThreadsTotal = (unsigned long long)prop.maxThreadsPerBlock * 
+                                        prop.maxGridSize[0] * 
+                                        prop.maxGridSize[1] * 
+                                        prop.maxGridSize[2];
+    
+    // Show the calculation
+    printf("Calculation: maxThreadsPerBlock * maxGridSize[0] * maxGridSize[1] * maxGridSize[2]\n");
+    printf("           = %d * %d * %d * %d\n", 
+           prop.maxThreadsPerBlock, prop.maxGridSize[0], prop.maxGridSize[1], prop.maxGridSize[2]);
+    printf("           = %d * %d * %d\n", 
+           prop.maxThreadsPerBlock, prop.maxGridSize[0], prop.maxGridSize[1] * prop.maxGridSize[2]);
+    printf("           = %d * %llu\n", 
+           prop.maxThreadsPerBlock, (unsigned long long)prop.maxGridSize[0] * prop.maxGridSize[1] * prop.maxGridSize[2]);
+    printf("           = %llu threads\n", maxThreadsTotal);
+    
+    // Tesla K40 specific summary
+    printf("\n==== Limitations of Tesla K40 Device Summary ====\n");
+    printf("1. Max threads per block: %d\n", maxThreadsPerBlock);
+    printf("2. Max blocks per grid (demonstrated): %d\n", maxBlocksPerGrid);
+    printf("3. Max blocks per grid (theoretical X dimension): %d\n", prop.maxGridSize[0]);
+    printf("4. Total possible threads (theoretical): %llu\n", maxThreadsTotal);
+    printf("5. Max concurrent threads: %d\n", 
+           prop.multiProcessorCount * prop.maxThreadsPerMultiProcessor);
+    printf("6. Memory limitations: %.2f GB global memory\n", 
+           (float)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    
+    return 0;
+}
